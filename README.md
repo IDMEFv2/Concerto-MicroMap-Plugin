@@ -55,7 +55,16 @@ Users can define rules for each monitored object directly from the UI:
 - **Rules Modal**: Macro-aligned modal structure for consistent rule editing experience.
 - **Defensive Event Binding**: Safe listener registration avoids runtime crashes from missing DOM nodes.
 
-### 9. Micro Route Reference
+### 9. Selector and Loading Behavior
+- **No Default Selector Card in DOM**: The asset selector card is not pre-rendered at page load.
+- **Selector Created on Demand**: The selector card is created only when bootstrap confirms that no asset/plan can be loaded automatically.
+- **Loading-First Priority**: During load attempts (including `get_micro_plans_list` and `load_micro_floor_plan`), selector UI is suppressed to avoid transient flashes.
+- **Handoff Stability**: In Macro-to-Micro handoff with valid context, selector UI is not shown while target asset/plan loading is in progress.
+- **Sidebar Switch Stability**: Switching asset from the sidebar keeps selector UI hidden until loading settles.
+- **Fallback Rule**: If no asset can be resolved after all load attempts complete, the selector card is then rendered and shown to the user.
+- **Empty-State Rule**: Empty-state guidance is shown only when the view is idle, no selector card is present, and no SVG is loaded.
+
+### 10. Micro Route Reference
 - `/micro_map/get_micro_navigation_context`: Reads and consumes per-user Macro navigation context.
 - `/micro_map/get_micro_plans_list`: Returns available floor plans for one asset.
 - `/micro_map/get_micro_plans_list_bulk`: Returns available floor plans for multiple assets.

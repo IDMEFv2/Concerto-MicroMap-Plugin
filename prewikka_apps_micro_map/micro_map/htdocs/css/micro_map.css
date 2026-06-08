@@ -11,6 +11,50 @@
     width: 100%;
     flex: 1;
     min-height: 0;
+    position: relative;
+}
+
+#micro-map-empty-state {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 3.25rem;
+    background:
+        radial-gradient(circle at 20% 20%, rgba(15, 91, 136, 0.1), transparent 46%),
+        radial-gradient(circle at 80% 75%, rgba(8, 77, 115, 0.12), transparent 42%),
+        linear-gradient(135deg, #f5f9fc 0%, #eef4f8 100%);
+}
+
+.micro-map-empty-card {
+    max-width: 50rem;
+    min-height: 20rem;
+    width: min(82vw, 780px);
+    padding: 2rem 2.35rem;
+    border: 1px solid #d6e1ea;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.92);
+    box-shadow: 0 14px 30px rgba(8, 77, 115, 0.14);
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+}
+
+.micro-map-empty-card h2 {
+    margin: 0 0 0.7rem;
+    color: #0a4668;
+    font-size: 1.75rem;
+    font-weight: 700;
+}
+
+.micro-map-empty-card p {
+    margin: 0;
+    color: #3f5666;
+    font-size: 1.14rem;
+    line-height: 1.55;
 }
 
 #svg-container {
@@ -373,9 +417,12 @@
     height: 2.2rem;
     border: 1px solid #cfcfcf;
     border-radius: 6px;
-    padding: 0.2rem 0.4rem;
+    padding: 0.2rem 2rem 0.2rem 0.4rem;
     background: #ffffff;
     box-sizing: border-box;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .micro-plan-switcher #load-plan-button,
@@ -612,4 +659,8 @@
 @media screen and (max-width: 576px) {
     .crud-modal { width: 95%; }
     #asset-selector-card { width: 95%; min-width: 0; }
+    #micro-map-empty-state { padding: 1.25rem; }
+    .micro-map-empty-card { width: 100%; padding: 1.4rem 1.2rem; }
+    .micro-map-empty-card h2 { font-size: 1.35rem; }
+    .micro-map-empty-card p { font-size: 1rem; }
 }

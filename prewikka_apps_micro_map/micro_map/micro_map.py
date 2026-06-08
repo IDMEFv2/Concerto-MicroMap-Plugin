@@ -1,12 +1,9 @@
 import pkg_resources
-import re
-import ipaddress
-import xml.etree.ElementTree as ET
 import os
 import json
 import tempfile
 
-from prewikka import database, template, view, error, mainmenu, response, hookmanager
+from prewikka import database, template, view, error, mainmenu, response
 from prewikka.dataprovider import Criterion
 
 class Micro_Map(object):
@@ -237,6 +234,96 @@ class MicroDatabase(database.DatabaseHelper):
         self._save_storage(data)
         return {"status": "success", "asset_ref": asset_ref, "svg_name": svg_name}
 
+    def reset_all_floor_plans(self):
+        self._save_storage({"assets": []})
+        return {"status": "success"}
+
+    def add_floor_plan_to_assets_without_plans(self, asset_refs, svg_name, svg_content, ref_type="entity_name"):
+        svg_name = "" if svg_name is None else str(svg_name).strip()
+        ref_type = "entity_name" if ref_type is None else str(ref_type).strip()
+
+        if not svg_name:
+            raise error.PrewikkaUserError(_("Operation refused"), message=_("Missing svg_name"))
+
+        normalized_refs = []
+        for raw_ref in (asset_refs or []):
+            asset_ref = "" if raw_ref is None else str(raw_ref).strip()
+            if asset_ref:
+                normalized_refs.append(asset_ref)
+
+        deduplicated_refs = list(dict.fromkeys(normalized_refs))
+        if not deduplicated_refs:
+            return {
+                "status": "success",
+                "svg_name": svg_name,
+                "requested": 0,
+                "applied": 0,
+                "applied_asset_refs": [],
+                "skipped_asset_refs": []
+            }
+
+        data = self._load_storage()
+        assets = data.get("assets", [])
+        asset_map = {}
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            key = str(asset.get("asset_ref") or "").strip()
+            if key:
+                asset_map[key] = asset
+
+        changed = False
+        applied_asset_refs = []
+        skipped_asset_refs = []
+
+        for asset_ref in deduplicated_refs:
+            existing_asset = asset_map.get(asset_ref)
+            if not existing_asset:
+                existing_asset = {
+                    "asset_ref": asset_ref,
+                    "ref_type": ref_type or "entity_name",
+                    "svg_items": []
+                }
+                assets.append(existing_asset)
+                asset_map[asset_ref] = existing_asset
+                changed = True
+            else:
+                existing_asset["ref_type"] = ref_type or existing_asset.get("ref_type") or "entity_name"
+
+            svg_items = existing_asset.get("svg_items")
+            if not isinstance(svg_items, list):
+                svg_items = []
+                existing_asset["svg_items"] = svg_items
+                changed = True
+
+            has_existing_plan = any(
+                isinstance(item, dict) and str(item.get("svg_name") or "").strip()
+                for item in svg_items
+            )
+            if has_existing_plan:
+                skipped_asset_refs.append(asset_ref)
+                continue
+
+            svg_items.append({
+                "svg_name": svg_name,
+                "svg_content": svg_content,
+                "object_rules": {}
+            })
+            applied_asset_refs.append(asset_ref)
+            changed = True
+
+        if changed:
+            self._save_storage(data)
+
+        return {
+            "status": "success",
+            "svg_name": svg_name,
+            "requested": len(deduplicated_refs),
+            "applied": len(applied_asset_refs),
+            "applied_asset_refs": applied_asset_refs,
+            "skipped_asset_refs": skipped_asset_refs
+        }
+
 class microMapView(view.View):
     plugin_htdocs = (("micro_map", pkg_resources.resource_filename(__name__, 'htdocs')),)
 
@@ -247,6 +334,55 @@ class microMapView(view.View):
     @view.route("/micro_map", methods=["GET", "POST"], permissions=[N_("IDMEF_VIEW")], menu=(N_("Alerts"), N_("Micro Map")))
     def listing(self):
         return view.ViewResponse(template.PrewikkaTemplate(__name__, "templates/micro_map.mak").render(), menu=mainmenu.HTMLMainMenu())
+
+    def _get_presets_dir(self):
+        return pkg_resources.resource_filename(__name__, "htdocs/samples/presets")
+
+    def _sanitize_preset_filename(self, raw_filename):
+        if raw_filename is None:
+            raise error.PrewikkaUserError(_("Operation refused"), message=_("Missing preset filename"))
+
+        filename = str(raw_filename).strip()
+        if not filename:
+            raise error.PrewikkaUserError(_("Operation refused"), message=_("Missing preset filename"))
+
+        safe_name = os.path.basename(filename)
+        if safe_name != filename:
+            raise error.PrewikkaUserError(_("Operation refused"), message=_("Invalid preset filename"))
+
+        if not safe_name.lower().endswith(".svg"):
+            raise error.PrewikkaUserError(_("Operation refused"), message=_("Preset must be an SVG file"))
+
+        return safe_name
+
+    def _load_floor_plan_preset_content(self, safe_name):
+        presets_dir = self._get_presets_dir()
+        file_path = os.path.join(presets_dir, safe_name)
+
+        if not os.path.isfile(file_path):
+            raise error.PrewikkaUserError(_("Operation refused"), message=_("Preset file not found"))
+
+        with open(file_path, "r", encoding="utf-8-sig") as f:
+            return f.read()
+
+    def _format_preset_display_name(self, filename):
+        safe_name = os.path.basename(str(filename or "").strip())
+        if not safe_name:
+            return "Sample"
+
+        lower_name = safe_name.lower()
+        if lower_name.endswith(".drawio.svg"):
+            base_name = safe_name[:-len(".drawio.svg")]
+        elif lower_name.endswith(".svg"):
+            base_name = safe_name[:-len(".svg")]
+        else:
+            base_name = safe_name
+
+        cleaned = " ".join(base_name.replace("_", " ").split())
+        if not cleaned:
+            return "Sample"
+
+        return cleaned.title()
 
     def _get_navigation_context_path(self):
         storage_dir = "/tmp/prewikka_plugin_navigation"
@@ -314,6 +450,61 @@ class microMapView(view.View):
     @view.route("/micro_map/get_micro_navigation_context", methods=["GET", "POST"])
     def get_navigation_context(self):
         return self._pop_navigation_context_for_current_user()
+
+    @view.route("/micro_map/list_floor_plan_presets", methods=["GET"])
+    def list_floor_plan_presets(self):
+        presets_dir = self._get_presets_dir()
+
+        if not os.path.isdir(presets_dir):
+            return {"status": "success", "presets": []}
+
+        filenames = [
+            name for name in os.listdir(presets_dir)
+            if name.lower().endswith(".svg") and os.path.isfile(os.path.join(presets_dir, name))
+        ]
+        filenames.sort()
+
+        presets = []
+        seen_keys = set()
+        for name in filenames:
+            display_name = self._format_preset_display_name(name)
+            unique_key = f"{display_name.lower()}::{name.lower()}"
+            if unique_key in seen_keys:
+                continue
+            seen_keys.add(unique_key)
+            presets.append({
+                "filename": name,
+                "display_name": display_name
+            })
+
+        return {"status": "success", "presets": presets}
+
+    @view.route("/micro_map/reset_micro_state", methods=["POST"])
+    def reset_micro_state(self):
+        return self._db.reset_all_floor_plans()
+
+    @view.route("/micro_map/apply_floor_plan_preset_to_missing", methods=["POST"])
+    def apply_floor_plan_preset_to_missing(self):
+        safe_name = self._sanitize_preset_filename(env.request.parameters.get("filename"))
+
+        raw_asset_refs = env.request.parameters.get("asset_refs")
+        asset_refs = []
+        if raw_asset_refs:
+            try:
+                parsed = json.loads(raw_asset_refs)
+                if isinstance(parsed, list):
+                    asset_refs = parsed
+            except Exception:
+                asset_refs = []
+
+        svg_content = self._load_floor_plan_preset_content(safe_name)
+
+        return self._db.add_floor_plan_to_assets_without_plans(
+            asset_refs=asset_refs,
+            svg_name=safe_name,
+            svg_content=svg_content,
+            ref_type="entity_name"
+        )
 
     @view.route("/micro_map/get_micro_alerts_bulk_for_asset", methods=["POST"])
     def get_alerts_bulk_for_asset(self):

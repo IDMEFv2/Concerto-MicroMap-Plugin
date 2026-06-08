@@ -4,7 +4,6 @@ const alertTooltipDataByObjectId = new Map();
 const trackedTooltipState = { element: null, objectId: null };
 let selectedMonitoredObjectId = null;
 var loadedSvg = "";
-const DEFAULT_PLAN_NAME = "First Floor";
 const navigationContext = {
     has_reference: false,
     asset_ref: "",
@@ -14,9 +13,12 @@ const navigationContext = {
 };
 const MICRO_MAP_DOC_EVENT_NS = ".microMap";
 const MICRO_MAP_LAST_ASSET_KEY = "micro_map_last_asset";
+const MICRO_DEFAULT_FLOOR_PRESET = "office_sample.drawio.svg";
+let microFloorPlanPresetInitPromise = null;
 let selectedManageSvgName = "";
 let selectedManageSvgText = "";
 let selectedMicroRuleObjectId = null;
+let microMapLoadingDepth = 0;
 const MICRO_DEFAULT_COLOR = "#5cb85c";
 const DEFAULT_COLOR_RULES = [
     {
@@ -51,7 +53,6 @@ async function loadNavigationContext() {
         });
 
         if (response && typeof response === "object") {
-            console.log(response)
             navigationContext.has_reference = !!response.has_reference;
             navigationContext.asset_ref = String(response.asset_ref || "").trim();
             navigationContext.ref_type = String(response.ref_type || "").trim();
@@ -67,7 +68,6 @@ async function loadNavigationContext() {
     }
 
     window.microMapNavigationContext = { ...navigationContext };
-    console.log("Micro map navigation context:", window.microMapNavigationContext);
     return { ...navigationContext };
 }
 
@@ -129,11 +129,124 @@ function setMainUiVisible(isVisible) {
         }
     }
     if (sidebarToggle) sidebarToggle.classList.toggle("is-hidden", !isVisible);
+    syncMicroMapEmptyState();
 }
 
-function setAssetSelectorVisible(isVisible) {
+function setSidebarDrawerClosed(isClosed) {
+    const sidebar = document.getElementById("sidebar");
+    if (!sidebar) return;
+
+    sidebar.classList.toggle("drawer-closed", !!isClosed);
+}
+
+function syncMicroMapEmptyState() {
+    const emptyState = document.getElementById("micro-map-empty-state");
+    const mainMap = document.getElementById("main-map");
     const overlay = document.getElementById("asset-selector-overlay");
-    if (overlay) overlay.classList.toggle("is-hidden", !isVisible);
+
+    if (!emptyState || !mainMap) return;
+
+    const mainUiVisible = !mainMap.classList.contains("is-hidden");
+    // The selector overlay only exists in the DOM when it is actually shown.
+    const overlayVisible = !!overlay;
+    const loadingInProgress = microMapLoadingDepth > 0;
+    const hasSvgLoaded = !!loadedSvg;
+    const shouldShow = mainUiVisible && !overlayVisible && !loadingInProgress && !hasSvgLoaded;
+
+    emptyState.classList.toggle("is-hidden", !shouldShow);
+}
+
+function buildAssetSelectorOverlay() {
+    const overlay = document.createElement("div");
+    overlay.id = "asset-selector-overlay";
+    overlay.innerHTML = `
+        <div id="asset-selector-card" class="crud-modal-border">
+            <div class="custom-modal-header bg-primary">
+                <h3>Select an Asset</h3>
+            </div>
+            <div class="custom-modal-body">
+                <p id="asset-selector-message">Choose an asset from Macro Map to open Micro Map.</p>
+                <select id="asset-selector-dropdown" class="modal-input"></select>
+                <div class="flex w-100 justify-end">
+                    <button id="asset-selector-load" class="btn btn-primary" type="button">Open selected asset</button>
+                </div>
+            </div>
+        </div>
+    `;
+    return overlay;
+}
+
+function getAssetSelectorParent() {
+    const mainMap = document.getElementById("main-map");
+    if (mainMap && mainMap.parentElement) return mainMap.parentElement;
+    return document.body;
+}
+
+function removeAssetSelector() {
+    const overlay = document.getElementById("asset-selector-overlay");
+    if (overlay && overlay.parentElement) {
+        overlay.parentElement.removeChild(overlay);
+    }
+    syncMicroMapEmptyState();
+}
+
+function beginMicroMapLoading() {
+    microMapLoadingDepth += 1;
+    // While loading, the selector card must not be present at all.
+    removeAssetSelector();
+    syncMicroMapEmptyState();
+}
+
+function endMicroMapLoading() {
+    microMapLoadingDepth = Math.max(0, microMapLoadingDepth - 1);
+    syncMicroMapEmptyState();
+}
+
+function showAssetSelector(entityNames, message) {
+    removeAssetSelector();
+
+    const overlay = buildAssetSelectorOverlay();
+    getAssetSelectorParent().appendChild(overlay);
+
+    const loadBtn = overlay.querySelector("#asset-selector-load");
+    if (loadBtn) {
+        loadBtn.addEventListener("click", onAssetSelectorLoadClick);
+    }
+
+    populateAssetSelector(entityNames);
+    if (message) {
+        setAssetSelectorMessage(message);
+    }
+
+    syncMicroMapEmptyState();
+}
+
+async function onAssetSelectorLoadClick() {
+    const dropdown = document.getElementById("asset-selector-dropdown");
+    const selectedAsset = dropdown ? String(dropdown.value || "").trim() : "";
+    if (!selectedAsset) {
+        setAssetSelectorMessage("No asset selected. Choose one from the list.");
+        return;
+    }
+
+    navigationContext.has_reference = true;
+    navigationContext.asset_ref = selectedAsset;
+    navigationContext.ref_type = "entity_name";
+    navigationContext.source = "micro_map_selector";
+    navigationContext.svg_name = "";
+    window.microMapNavigationContext = { ...navigationContext };
+    saveLastSelectedAsset(selectedAsset);
+
+    const sidebarAssetDropdown = document.getElementById("asset-switch-select");
+    if (sidebarAssetDropdown) {
+        sidebarAssetDropdown.value = selectedAsset;
+    }
+
+    // Tear the card down before loading so it cannot linger during the calls.
+    removeAssetSelector();
+    setMainUiVisible(true);
+    await initializeMapForCurrentAsset();
+    await refreshAlertsFromMacroMapFallback();
 }
 
 function setAssetSelectorMessage(message) {
@@ -740,7 +853,8 @@ function populateAssetDropdown(dropdownId, buttonId, entityNames, options = {}) 
     names.forEach((name) => {
         const option = document.createElement("option");
         option.value = name;
-        option.textContent = name;
+        option.textContent = microTruncateLabel(name, 28);
+        option.title = name;
         dropdown.appendChild(option);
     });
 
@@ -783,9 +897,14 @@ async function switchToAsset(assetRef, source = "micro_map_switcher") {
     window.microMapNavigationContext = { ...navigationContext };
 
     saveLastSelectedAsset(selectedAsset);
-    clearCurrentPlanView();
-    await initializeMapForCurrentAsset();
-    await refreshAlertsFromMacroMapFallback();
+    beginMicroMapLoading();
+    try {
+        clearCurrentPlanView();
+        await initializeMapForCurrentAsset();
+        await refreshAlertsFromMacroMapFallback();
+    } finally {
+        endMicroMapLoading();
+    }
 
     const assetSwitcher = document.getElementById("asset-switch-select");
     if (assetSwitcher) {
@@ -794,20 +913,178 @@ async function switchToAsset(assetRef, source = "micro_map_switcher") {
 }
 
 async function initializeMapForCurrentAsset(preferredPlanName = null) {
-    const preferred = String(preferredPlanName || "").trim();
-    await getPlansList(preferred || null);
+    beginMicroMapLoading();
+    try {
+        const preferred = String(preferredPlanName || "").trim();
+        const plans = await getPlansList(preferred || null);
+        const planNames = Array.isArray(plans) ? plans : [];
 
-    const initialPlanName = preferred || getSelectedPlanName() || String(navigationContext.svg_name || "").trim();
-    if (initialPlanName) {
-        await loadFloorPlanToDb(initialPlanName);
+        let initialPlanName = "";
+        if (preferred && planNames.includes(preferred)) {
+            initialPlanName = preferred;
+        } else {
+            const selectedPlanName = getSelectedPlanName();
+            if (selectedPlanName && planNames.includes(selectedPlanName)) {
+                initialPlanName = selectedPlanName;
+            } else if (planNames.length > 0) {
+                initialPlanName = planNames[0];
+            }
+        }
+
+        if (initialPlanName) {
+            const didLoad = await loadFloorPlanToDb(initialPlanName);
+            if (didLoad) {
+                setSidebarDrawerClosed(true);
+                return;
+            }
+        }
+
+        clearCurrentPlanView();
+
+        // When there is no floor plan for the selected asset, keep the menu open to guide the user.
+        setSidebarDrawerClosed(false);
+    } finally {
+        endMicroMapLoading();
+    }
+}
+
+async function initializeFloorPlanPresetButtons() {
+    if (microFloorPlanPresetInitPromise) {
+        return microFloorPlanPresetInitPromise;
+    }
+
+    const containers = $("#manage-sample-presets");
+    if (!containers.length) return;
+
+    const container = containers.first();
+    if (containers.length > 1) {
+        // If stale DOM copies exist, render only in the first container.
+        containers.slice(1).empty();
+    }
+
+    microFloorPlanPresetInitPromise = (async function () {
+        container.empty();
+
+        try {
+            const response = await $.ajax({
+                url: "/micro_map/list_floor_plan_presets",
+                method: "GET",
+                dataType: "json"
+            });
+
+            const presets = Array.isArray(response?.presets) ? response.presets : [];
+            if (presets.length === 0) {
+                container.append($("<span>", { text: "No sample presets available" }));
+                return;
+            }
+
+            const seen = new Set();
+            presets.forEach((preset) => {
+                const filename = String(preset?.filename || "").trim();
+                const displayName = String(preset?.display_name || filename).trim();
+                const dedupeKey = `${displayName.toLowerCase()}::${filename.toLowerCase()}`;
+                if (!filename || seen.has(dedupeKey)) return;
+                seen.add(dedupeKey);
+
+                const button = $("<button>", {
+                    type: "button",
+                    class: "btn btn-primary",
+                    text: displayName,
+                    "data-preset-key": dedupeKey
+                });
+
+                button.on("click", async function () {
+                    await applyFloorPlanPresetToMissingAssets(filename);
+                });
+
+                container.append(button);
+            });
+        } catch (error) {
+            console.error("Failed to load floor plan presets", error);
+            container.append($("<span>", { text: "Failed to load presets" }));
+        }
+    })();
+
+    try {
+        await microFloorPlanPresetInitPromise;
+    } finally {
+        microFloorPlanPresetInitPromise = null;
+    }
+}
+
+async function applyFloorPlanPresetToMissingAssets(filename = MICRO_DEFAULT_FLOOR_PRESET) {
+    const presetFilename = String(filename || "").trim();
+    if (!presetFilename) {
+        console.warn("Missing sample preset filename.");
         return;
     }
 
-    clearCurrentPlanView();
+    let assets = [];
+    try {
+        const macroState = await fetchMacroMapState();
+        assets = extractMacroMapAssets(macroState)
+            .map((asset) => String(asset.entity_name || "").trim())
+            .filter(Boolean);
+    } catch (error) {
+        console.error("Failed to retrieve assets from Macro Map state", error);
+        return;
+    }
+
+    const currentAsset = ensureCurrentAssetRef({ warn: false });
+    if (currentAsset && !assets.includes(currentAsset)) {
+        assets.push(currentAsset);
+    }
+
+    const uniqueAssets = Array.from(new Set(assets));
+    if (!uniqueAssets.length) {
+        console.warn("No assets available to apply the sample floor plan.");
+        return;
+    }
+
+    try {
+        const response = await $.ajax({
+            url: "/micro_map/apply_floor_plan_preset_to_missing",
+            method: "POST",
+            dataType: "json",
+            data: {
+                filename: presetFilename,
+                asset_refs: JSON.stringify(uniqueAssets)
+            }
+        });
+
+        const savedPlanName = String(response?.svg_name || "").trim();
+        const availablePlans = currentAsset ? await getPlansList(savedPlanName || null) : [];
+
+        if (currentAsset) {
+            const planToLoad = (savedPlanName && availablePlans.includes(savedPlanName))
+                ? savedPlanName
+                : (availablePlans[0] || "");
+
+            if (planToLoad) {
+                const loaded = await loadFloorPlanToDb(planToLoad);
+                if (loaded) {
+                    setSidebarDrawerClosed(true);
+                    return;
+                }
+            }
+
+            clearCurrentPlanView();
+            setSidebarDrawerClosed(false);
+            await refreshAlertsForCurrentMap();
+        }
+    } catch (error) {
+        console.error("Failed to apply sample floor plan", error);
+    }
 }
 
 async function initializeListeners() {
+    // The selector card does not exist in the DOM by default. Make sure any
+    // stale instance from a previous render is gone before we start.
+    removeAssetSelector();
+
     const navCtx = await loadNavigationContext();
+    await initializeFloorPlanPresetButtons();
+
     const safeAddEventListener = (id, eventName, handler) => {
         const el = document.getElementById(id);
         if (!el) {
@@ -816,8 +1093,6 @@ async function initializeListeners() {
         }
         el.addEventListener(eventName, handler);
     };
-    // syncMicroMapContainerOffset();
-    // window.addEventListener("resize", syncMicroMapContainerOffset);
 
     safeAddEventListener("load-plan-button", "click", function () {
         loadFloorPlanToDb()
@@ -910,6 +1185,10 @@ async function initializeListeners() {
         await deleteSelectedPlanFromDb(selectedPlan);
     });
 
+    safeAddEventListener("manage-reset-plugin-button", "click", async function () {
+        await resetMicroPluginState();
+    });
+
     detachMicroMapDocumentHandlers();
     $(document).on(`click${MICRO_MAP_DOC_EVENT_NS}`, function (event) {
         // If micro map DOM is not present anymore, do not touch shared popovers.
@@ -985,53 +1264,14 @@ async function initializeListeners() {
 
     safeAddEventListener("blink-random", "click", blinkRandomElement);
 
-    safeAddEventListener("asset-selector-load", "click", async function () {
-        const dropdown = document.getElementById("asset-selector-dropdown");
-        const selectedAsset = dropdown ? String(dropdown.value || "").trim() : "";
-        if (!selectedAsset) {
-            setAssetSelectorMessage("No asset selected. Choose one from the list.");
-            return;
-        }
-
-        navigationContext.has_reference = true;
-        navigationContext.asset_ref = selectedAsset;
-        navigationContext.ref_type = "entity_name";
-        navigationContext.source = "micro_map_selector";
-        navigationContext.svg_name = "";
-        window.microMapNavigationContext = { ...navigationContext };
-        saveLastSelectedAsset(selectedAsset);
-
-        const sidebarAssetDropdown = document.getElementById("asset-switch-select");
-        if (sidebarAssetDropdown) {
-            sidebarAssetDropdown.value = selectedAsset;
-        }
-
-        setAssetSelectorVisible(false);
-        setMainUiVisible(true);
-        await initializeMapForCurrentAsset();
-        await refreshAlertsFromMacroMapFallback();
-    });
-
     microBindRulesEditor("#micro-rules-grid-container");
 
-    // PRIORITY: Direct navigation from Macro with context – handle immediately
-    // before any other AJAX calls that might interfere on first visit.
     if (navCtx && navCtx.has_reference && navCtx.asset_ref) {
         setMainUiVisible(true);
-        setAssetSelectorVisible(false);
         saveLastSelectedAsset(navCtx.asset_ref);
 
         const targetPlan = String(navCtx.svg_name || "").trim();
-        if (targetPlan) {
-            await loadFloorPlanToDb(targetPlan);
-            await getPlansList(targetPlan);
-        } else {
-            await getPlansList(null);
-            const firstPlan = getSelectedPlanName();
-            if (firstPlan) {
-                await loadFloorPlanToDb(firstPlan);
-            }
-        }
+        await initializeMapForCurrentAsset(targetPlan || null);
 
         try {
             const names = await fetchMacroMapEntityNames();
@@ -1043,7 +1283,7 @@ async function initializeListeners() {
     }
 
     setMainUiVisible(false);
-    setAssetSelectorVisible(false);
+    removeAssetSelector();
 
     let availableEntityNames = [];
     try {
@@ -1065,6 +1305,8 @@ async function initializeListeners() {
         return;
     }
 
+    let selectorEntities = availableEntityNames;
+    let selectorMessage = "";
     try {
         const savedAssetRef = loadLastSelectedAsset();
         if (savedAssetRef && availableEntityNames.includes(savedAssetRef)) {
@@ -1082,19 +1324,18 @@ async function initializeListeners() {
             return;
         }
 
-        if (availableEntityNames.length > 0) {
-            setAssetSelectorMessage("Select an asset from Macro Map to continue.");
-        } else {
-            setAssetSelectorMessage("No assets found in Macro Map. Load assets there first.");
-        }
+        selectorMessage = availableEntityNames.length > 0
+            ? "Select an asset from Macro Map to continue."
+            : "No assets have been loaded on the macro map yet. Please upload some assets before trying again.";
     } catch (error) {
         console.error("Failed to load assets from Macro Map:", error);
-        populateAssetSelector([]);
         populateAssetSwitcher([]);
-        setAssetSelectorMessage("Cannot load assets from Macro Map right now.");
+        selectorEntities = [];
+        selectorMessage = "Cannot load assets from Macro Map right now.";
     }
 
-    setAssetSelectorVisible(true);
+    setMainUiVisible(false);
+    showAssetSelector(selectorEntities, selectorMessage);
 }
 
 function ensureTrackedTooltipElement() {
@@ -1627,6 +1868,18 @@ function getSelectedPlanName() {
     return String(navigationContext.svg_name || "").trim();
 }
 
+function microTruncateLabel(value, maxLength = 28) {
+    const text = String(value || "").trim();
+    if (!text) return "";
+
+    const safeMax = Number.isFinite(Number(maxLength)) ? Number(maxLength) : 28;
+    if (safeMax <= 3 || text.length <= safeMax) {
+        return text;
+    }
+
+    return `${text.slice(0, safeMax - 3)}...`;
+}
+
 function renderPlansList(plans) {
     const select = $("#floor-plan-select");
     const deleteSelect = $("#manage-delete-plan-dropdown");
@@ -1639,7 +1892,8 @@ function renderPlansList(plans) {
         if (!planName) return;
         const value = String(planName).trim();
         if (!value) return;
-        select.append(`<option value="${value}">${value}</option>`);
+        const displayText = microTruncateLabel(value, 28);
+        select.append(`<option value="${value}" title="${value}">${displayText}</option>`);
         if (deleteSelect.length) deleteSelect.append(`<option value="${value}">${value}</option>`);
     });
 
@@ -1660,6 +1914,8 @@ function clearCurrentPlanView() {
     if (container) {
         container.innerHTML = "";
     }
+
+    syncMicroMapEmptyState();
 }
 
 async function getPlansList(selectedPlan = null) {
@@ -1669,25 +1925,28 @@ async function getPlansList(selectedPlan = null) {
         return;
     }
 
-    await $.ajax({
+    const response = await $.ajax({
         url: "/micro_map/get_micro_plans_list",
         type: "POST",
         data: {
             asset_ref: assetRef
         },
-        dataType: "json",
-        success: function (response) {
-            renderPlansList(response);
-
-            const preferredPlan = (selectedPlan && String(selectedPlan).trim()) ? String(selectedPlan).trim() : getSelectedPlanName();
-            if (preferredPlan) {
-                $("#floor-plan-select").val(preferredPlan);
-                $("#manage-delete-plan-dropdown").val(preferredPlan);
-            }
-
-            console.log(response)
-        }
+        dataType: "json"
     });
+
+    renderPlansList(response);
+
+    const preferredPlan = (selectedPlan && String(selectedPlan).trim()) ? String(selectedPlan).trim() : getSelectedPlanName();
+    if (preferredPlan) {
+        $("#floor-plan-select").val(preferredPlan);
+        $("#manage-delete-plan-dropdown").val(preferredPlan);
+    }
+
+    const normalizedPlans = Array.isArray(response)
+        ? response.map((planName) => String(planName || "").trim()).filter(Boolean)
+        : [];
+
+    return normalizedPlans;
 }
 
 async function saveFloorPlanToDb(planName = null) {
@@ -1720,10 +1979,7 @@ async function saveFloorPlanToDb(planName = null) {
     await $.ajax({
         url: "/micro_map/add_micro_floor_plan",
         type: "POST",
-        data: body,
-        success: function (response) {
-            console.log(response);
-        }
+        data: body
     });
 
     navigationContext.svg_name = nameToSave;
@@ -1734,13 +1990,13 @@ async function saveFloorPlanToDb(planName = null) {
 async function loadFloorPlanToDb(planName = null) {
     const assetRef = ensureCurrentAssetRef();
     if (!assetRef) {
-        return;
+        return false;
     }
 
     const nameToLoad = (planName && String(planName).trim()) ? String(planName).trim() : getSelectedPlanName();
     if (!nameToLoad) {
         console.warn("Missing SVG name to load.");
-        return;
+        return false;
     }
 
     const body = {
@@ -1751,22 +2007,24 @@ async function loadFloorPlanToDb(planName = null) {
     navigationContext.svg_name = nameToLoad;
     window.microMapNavigationContext = { ...navigationContext };
 
-    await $.ajax({
+    const response = await $.ajax({
         url: "/micro_map/load_micro_floor_plan",
         type: "POST",
         data: body,
-        dataType: "json",
-        success: async function (response) {
-            if (!response || !response.svg_content) {
-                console.warn("Plan not found or missing SVG content.");
-                return;
-            }
-            $("#floor-plan-select").val(nameToLoad);
-            $("#manage-delete-plan-dropdown").val(nameToLoad);
-            processSvgFromDb(response.svg_content, response.object_rules || {})
-            await refreshAlertsForCurrentMap();
-        }
+        dataType: "json"
     });
+
+    if (!response || !response.svg_content) {
+        console.warn("Plan not found or missing SVG content.");
+        return false;
+    }
+
+    $("#floor-plan-select").val(nameToLoad);
+    $("#manage-delete-plan-dropdown").val(nameToLoad);
+    processSvgFromDb(response.svg_content, response.object_rules || {});
+    await refreshAlertsForCurrentMap();
+
+    return true;
 }
 
 async function uploadAndSaveFloorPlanFromModal() {
@@ -1821,16 +2079,49 @@ async function deleteSelectedPlanFromDb(planName = null) {
         return;
     }
 
-    await getPlansList(null);
+    const remainingPlans = await getPlansList(null);
+    const nextPlan = Array.isArray(remainingPlans) && remainingPlans.length > 0 ? remainingPlans[0] : "";
 
-    const nextPlan = getSelectedPlanName();
     if (nextPlan) {
+        $("#floor-plan-select").val(nextPlan);
         $("#manage-delete-plan-dropdown").val(nextPlan);
-        await loadFloorPlanToDb(nextPlan);
+        const loaded = await loadFloorPlanToDb(nextPlan);
+        if (loaded) {
+            setSidebarDrawerClosed(true);
+            return;
+        }
+    }
+
+    navigationContext.svg_name = "";
+    window.microMapNavigationContext = { ...navigationContext };
+    clearCurrentPlanView();
+    setSidebarDrawerClosed(false);
+}
+
+async function resetMicroPluginState() {
+    const shouldProceed = window.confirm("Are you sure you want to permanently delete all floor plans for all assets? This action cannot be undone.");
+    if (!shouldProceed) {
         return;
     }
 
+    const response = await $.ajax({
+        url: "/micro_map/reset_micro_state",
+        type: "POST",
+        dataType: "json"
+    });
+
+    if (!response || response.status !== "success") {
+        console.warn("Failed to reset micro map plugin state.");
+        return;
+    }
+
+    navigationContext.svg_name = "";
+    window.microMapNavigationContext = { ...navigationContext };
+
     clearCurrentPlanView();
+    await getPlansList(null);
+    setSidebarDrawerClosed(false);
+    closeManageFloorPlansModal();
 }
 
 function processSvgDocument(svgText, objectRulesById = {}) {
@@ -1910,6 +2201,7 @@ function processSvgDocument(svgText, objectRulesById = {}) {
     const container = document.getElementById("svg-container");
     container.innerHTML = "";
     container.appendChild(svgElement);
+    syncMicroMapEmptyState();
 }
 
 function processSvg(svgText) {

@@ -66,6 +66,13 @@
 
   <div class="custom-modal-body">
     <div class="crud-modal-section">
+      <span class="bold">Quick Start - Load a sample floor plan</span>
+      <div id="manage-sample-presets" class="flex gap-1 wrap pl-1 pr-1"></div>
+    </div>
+
+    <hr class="modal-hr">
+
+    <div class="crud-modal-section">
       <span class="bold">Upload and save a new floor plan</span>
       <div class="flex gap-1">
         <button id="manage-select-svg-button" class="btn btn-primary" type="button">Select SVG</button>
@@ -94,6 +101,16 @@
       </div>
       <div class="flex w-100 justify-end">
         <button id="manage-delete-plan-button" class="btn btn-danger" type="button">Delete selected plan</button>
+      </div>
+    </div>
+
+    <hr class="modal-hr">
+
+    <div class="crud-modal-section">
+      <span class="bold">Plugin data management</span>
+      <div class="flex align-center justify-between gap-1">
+        <span>Permanently delete all floor plans for all assets:</span>
+        <button id="manage-reset-plugin-button" class="btn btn-danger" type="button">Reset Plugin</button>
       </div>
     </div>
   </div>
@@ -148,22 +165,13 @@
 
 <div id="micro-modal-mask" class="modal-mask"></div>
 
-<div id="asset-selector-overlay" class="is-hidden">
-  <div id="asset-selector-card" class="crud-modal-border">
-    <div class="custom-modal-header bg-primary">
-      <h3>Select an Asset</h3>
-    </div>
-    <div class="custom-modal-body">
-      <p id="asset-selector-message">Choose an asset from Macro Map to open Micro Map.</p>
-      <select id="asset-selector-dropdown" class="modal-input"></select>
-      <div class="flex w-100 justify-end">
-        <button id="asset-selector-load" class="btn btn-primary" type="button">Open selected asset</button>
-      </div>
+<div id="main-map" class="is-hidden">
+  <div id="micro-map-empty-state" class="is-hidden" aria-live="polite">
+    <div class="micro-map-empty-card">
+      <h2>No floor plan loaded yet</h2>
+      <p>Use the sidebar to select or upload a floor plan.</p>
     </div>
   </div>
-</div>
-
-<div id="main-map" class="is-hidden">
   <div id="svg-container"></div>
 </div>
 

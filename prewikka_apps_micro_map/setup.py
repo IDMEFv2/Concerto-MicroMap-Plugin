@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 
 setup(name="prewikka-apps-micro_map",
-      version="1.0.0",
+      version="1.1.0",
       author="Marco Compagno",
       author_email="marco_compagno@elmisoftware.com",
       url="https://www.prelude-siem.org",
@@ -20,7 +20,8 @@ setup(name="prewikka-apps-micro_map",
               "templates/*.mak",
               "sql/*.py",
               "htdocs/css/*.css",
-              "htdocs/js/*.js"
+              "htdocs/js/*.js",
+              "htdocs/samples/presets/*.svg"
           ],
       },
       
