@@ -2,6 +2,8 @@ import pkg_resources
 import os
 import json
 import tempfile
+import ast
+import base64
 
 from prewikka import database, template, view, error, mainmenu, response
 from prewikka.dataprovider import Criterion
@@ -517,7 +519,42 @@ class microMapView(view.View):
                 return _to_text(v[0])
             return str(v).strip()
 
+        def _get(row, index):
+            return row[index] if len(row) > index else None
+
+        def _normalize_dataprovider_value(value):
+            if value is None:
+                return None
+
+            if isinstance(value, dict):
+                return value
+
+            if isinstance(value, (list, tuple)):
+                normalized = [_normalize_dataprovider_value(item) for item in value]
+                normalized = [item for item in normalized if item is not None]
+
+                if len(normalized) == 0:
+                    return None
+                if len(normalized) == 1:
+                    return normalized[0]
+                return normalized
+
+            text = str(value).strip()
+
+            if text in ["", "None", "[None]"]:
+                return None
+
+            if (text.startswith("[") and text.endswith("]")) or (text.startswith("{") and text.endswith("}")):
+                try:
+                    parsed = ast.literal_eval(text)
+                    return _normalize_dataprovider_value(parsed)
+                except Exception:
+                    pass
+
+            return text
+
         payload = {}
+        
         raw_body = getattr(env.request, "body", None)
 
         if raw_body:
@@ -540,12 +577,52 @@ class microMapView(view.View):
         if not asset_ref:
             return {"status": "no_match", "data": [], "alerts_count": 0}
 
-        query_fields = [
-            "idmefv2.entityname",
-            "idmefv2.priority",
-            "idmefv2.target.ip",
-            "idmefv2.analyzer.hostname",
+        query_field_specs = [
+            ("entity_name", "idmefv2.entityname"),
+            ("priority", "idmefv2.priority"),
+            ("type", "idmefv2.type"),
+            ("category", "idmefv2.category"),
+            ("description", "idmefv2.description"),
+            ("create_time", "idmefv2.create_time"),
+            ("start_time", "idmefv2.start_time"),
+
+            ("target_id", "idmefv2.target.id"),
+            ("target_ip", "idmefv2.target.ip"),
+            ("target_hostname", "idmefv2.target.hostname"),
+            ("target_category", "idmefv2.target.category"),
+            ("target_location", "idmefv2.target.location"),
+            ("target_geolocation", "idmefv2.target.geolocation"),
+
+            ("analyzer_id", "idmefv2.analyzer.id"),
+            ("analyzer_ip", "idmefv2.analyzer.ip"),
+            ("analyzer_name", "idmefv2.analyzer.name"),
+            ("analyzer_hostname", "idmefv2.analyzer.hostname"),
+            ("analyzer_model", "idmefv2.analyzer.model"),
+            ("analyzer_category", "idmefv2.analyzer.category"),
+            ("analyzer_data", "idmefv2.analyzer.data"),
+            ("analyzer_method", "idmefv2.analyzer.method"),
+            ("analyzer_location", "idmefv2.analyzer.location"),
+            ("analyzer_geolocation", "idmefv2.analyzer.geolocation"),
+
+            ("sensor_id", "idmefv2.sensor.id"),
+            ("sensor_ip", "idmefv2.sensor.ip"),
+            ("sensor_name", "idmefv2.sensor.name"),
+            ("sensor_hostname", "idmefv2.sensor.hostname"),
+            ("sensor_model", "idmefv2.sensor.model"),
+            ("sensor_location", "idmefv2.sensor.location"),
+            ("sensor_geolocation", "idmefv2.sensor.geolocation"),
+            ("sensor_capturezone", "idmefv2.sensor.capture_zone"),
+
+            ("source_id", "idmefv2.source.id"),
+            ("source_ip", "idmefv2.source.ip"),
+            ("source_hostname", "idmefv2.source.hostname"),
+            ("source_category", "idmefv2.source.category"),
+            ("source_location", "idmefv2.source.location"),
+            ("source_geolocation", "idmefv2.source.geolocation"),
+            ("source_note", "idmefv2.source.note"),
         ]
+
+        query_fields = [field_path for _, field_path in query_field_specs]
 
         criteria = Criterion()
         if start_date:
@@ -562,14 +639,21 @@ class microMapView(view.View):
 
         data = []
         for row in ret:
-            data.append({
-                "entity_name": row[0] if len(row) > 0 else None,
-                "priority": row[1] if len(row) > 1 else None,
-                "target_ip": row[2] if len(row) > 2 else None,
-                "analyzer": row[3] if len(row) > 3 else None,
-            })
+            item = {}
+            for index, (output_name, _field_path) in enumerate(query_field_specs):
+                item[output_name] = _normalize_dataprovider_value(_get(row, index))
 
-        return {"status": "success", "data": data, "alerts_count": len(data)}
+            if not item.get("analyzer"):
+                item["analyzer"] = item.get("analyzer_hostname") or item.get("analyzer_name") or item.get("analyzer_ip")
+
+            data.append(item)
+
+        return {
+            "status": "success",
+            "data": data,
+            "alerts_count": len(data),
+            "queried_fields": query_fields
+        }
 
     @view.route("/micro_map/get_micro_time", methods=["GET"])
     def get_time(self):
@@ -674,5 +758,26 @@ class microMapView(view.View):
         if linkview:
             link = linkview[-1].make_url(criteria=criteria, **env.request.menu.get_parameters())
             return response.PrewikkaRedirectResponse(link)
+
+        return {"status": "no_match", "data": []}
+
+    @view.route("/micro_map/download_svg_guide", methods=["POST"])
+    def download_svg_guide(self):
+        filename = "drawio_svg_template_guide.md"
+        samples_dir = pkg_resources.resource_filename(__name__, "htdocs/samples")
+        file_path = os.path.join(samples_dir, filename)
+
+        if not os.path.isfile(file_path):
+            raise error.PrewikkaUserError(_("Operation refused"), message=_("File not found"))
+
+        with open(file_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+
+        return {
+            "status": "success",
+            "filename": filename,
+            "content_type": "application/octet-stream",
+            "data_base64": b64
+        }
 
         return {"status": "no_match", "data": []}

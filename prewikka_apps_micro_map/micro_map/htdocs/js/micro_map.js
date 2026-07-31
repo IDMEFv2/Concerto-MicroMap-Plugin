@@ -3,6 +3,7 @@ const connectedElementsMap = new Map();
 const alertTooltipDataByObjectId = new Map();
 const trackedTooltipState = { element: null, objectId: null };
 let selectedMonitoredObjectId = null;
+let isMicroRefreshInProgress = false;
 var loadedSvg = "";
 const navigationContext = {
     has_reference: false,
@@ -43,6 +44,18 @@ const DEFAULT_COLOR_RULES = [
         color: "#5cb85c"
     }
 ];
+
+const MICRO_DETECTION_ICON_LIBRARY = {
+    human: {
+        viewBox: "0 0 24 24",
+        path: "M20.822 18.096c-3.439-.794-6.64-1.49-5.09-4.418 4.72-8.912 1.251-13.678-3.732-13.678-5.082 0-8.464 4.949-3.732 13.678 1.597 2.945-1.725 3.641-5.09 4.418-3.073.71-3.188 2.236-3.178 4.904l.004 1h23.99l.004-.969c.012-2.688-.092-4.222-3.176-4.935z"
+    },
+
+    fallback: {
+        viewBox: "0 0 24 24",
+        path: "M6.4 4.9 L12 10.5 L17.6 4.9 L19.1 6.4 L13.5 12 L19.1 17.6 L17.6 19.1 L12 13.5 L6.4 19.1 L4.9 17.6 L10.5 12 L4.9 6.4 Z"
+    }
+};
 
 async function loadNavigationContext() {
     try {
@@ -182,6 +195,8 @@ function getAssetSelectorParent() {
     return document.body;
 }
 
+// Removes the selector card from the DOM entirely. While absent it can never
+// flash, not even during get_micro_plans_list / load_micro_floor_plan calls.
 function removeAssetSelector() {
     const overlay = document.getElementById("asset-selector-overlay");
     if (overlay && overlay.parentElement) {
@@ -202,6 +217,8 @@ function endMicroMapLoading() {
     syncMicroMapEmptyState();
 }
 
+// Creates and injects the selector card. Call this ONLY after all loading
+// calls have completed and we are sure that no asset/plan will be loaded.
 function showAssetSelector(entityNames, message) {
     removeAssetSelector();
 
@@ -1093,9 +1110,15 @@ async function initializeListeners() {
         }
         el.addEventListener(eventName, handler);
     };
+    // syncMicroMapContainerOffset();
+    // window.addEventListener("resize", syncMicroMapContainerOffset);
 
     safeAddEventListener("load-plan-button", "click", function () {
         loadFloorPlanToDb()
+    });
+
+    safeAddEventListener("refresh-data-micro", "click", async function () {
+        await refreshMicroData();
     });
 
     safeAddEventListener("manage-floor-plans", "click", async function () {
@@ -1130,6 +1153,27 @@ async function initializeListeners() {
         microAddRuleToSelectedObject();
         $("#micro-add-rule-button").css("display", "flex");
         $("#micro-insert-rules-div").css("display", "none");
+    });
+
+    safeAddEventListener("download-svg-guide", "click", function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+
+        $.ajax({
+            url: "/micro_map/download_svg_guide",
+            method: "POST",
+            dataType: "json",
+            data: {}
+        }).done(function (res) {
+            if (!res || res.status !== "success") { console.error("Download failed"); return; }
+            downloadBase64File(res.filename, res.content_type, res.data_base64);
+        }).fail(function (xhr) {
+            console.error(xhr.status, xhr.responseText);
+            console.error("Download failed");
+        });
+
+        return false;
     });
 
     safeAddEventListener("manage-select-svg-button", "click", function () {
@@ -1266,6 +1310,8 @@ async function initializeListeners() {
 
     microBindRulesEditor("#micro-rules-grid-container");
 
+    // PRIORITY: Direct navigation from Macro with context – handle immediately
+    // before any other AJAX calls that might interfere on first visit.
     if (navCtx && navCtx.has_reference && navCtx.asset_ref) {
         setMainUiVisible(true);
         saveLastSelectedAsset(navCtx.asset_ref);
@@ -1713,6 +1759,735 @@ function normalizeAlertJoinKey(value) {
     return extractComparableIp(value);
 }
 
+function normalizeMicroMatchKey(value) {
+    const key = normalizeAlertJoinKey(value);
+    return String(key || "").trim().toLowerCase();
+}
+
+function microGetObjectAttr(obj, name) {
+    return String(obj.getAttribute(name) || "").trim();
+}
+
+function microPickFirstNonEmpty(values) {
+    for (const value of values) {
+        const normalized = String(value || "").trim();
+        if (normalized) return normalized;
+    }
+    return "";
+}
+
+function microGetAlertCameraCandidateKeys(row) {
+    if (!row || typeof row !== "object") return [];
+
+    const rawKeys = [
+        row.sensor_ip,
+        row.target_ip,
+
+        row.sensor_hostname,
+        row.sensor_name,
+        row.sensor_id,
+
+        row.analyzer_ip,
+        row.analyzer_hostname,
+        row.analyzer_name,
+        row.analyzer,
+
+        row.target_hostname,
+        row.target_id,
+
+        row.source_ip,
+        row.source_hostname,
+        row.source_id,
+    ];
+
+    return Array.from(new Set(
+        rawKeys
+            .map(normalizeMicroMatchKey)
+            .filter(Boolean)
+    ));
+}
+
+function microGetCameraCandidateKeys(entry) {
+    if (!entry || typeof entry !== "object") return [];
+
+    const rawKeys = [
+        entry.sensor_ip,
+        entry.target,
+
+        entry.sensor_hostname,
+        entry.sensor_name,
+        entry.sensor_id,
+
+        entry.analyzer_ip,
+        entry.analyzer_hostname,
+        entry.analyzer_name,
+
+        entry.location,
+        entry.sensor_location,
+    ];
+
+    return Array.from(new Set(
+        rawKeys
+            .map(normalizeMicroMatchKey)
+            .filter(Boolean)
+    ));
+}
+
+function microIsCameraEntry(entry) {
+    if (!entry || typeof entry !== "object") return false;
+
+    return (
+        String(entry.type || "").toLowerCase() === "camera" ||
+        !!entry.sensor_ip ||
+        !!entry.sensor_name ||
+        !!entry.sensor_hostname ||
+        (!!entry.target && String(entry.type || "").toLowerCase() !== "beam")
+    );
+}
+
+function microFindCameraForAlert(row) {
+    const alertKeys = microGetAlertCameraCandidateKeys(row);
+    if (!alertKeys.length) return null;
+
+    for (const [objectId, entry] of monitoredElements.entries()) {
+        if (!microIsCameraEntry(entry)) continue;
+
+        const cameraKeys = microGetCameraCandidateKeys(entry);
+        const matchedKey = alertKeys.find((key) => cameraKeys.includes(key));
+
+        if (matchedKey) {
+            return {
+                objectId,
+                entry,
+                matchedKey,
+                alertKeys,
+                cameraKeys
+            };
+        }
+    }
+
+    return {
+        objectId: null,
+        entry: null,
+        matchedKey: "",
+        alertKeys,
+        cameraKeys: []
+    };
+}
+
+function microFindBeamForCamera(cameraEntry) {
+    if (!cameraEntry || !cameraEntry.connection) return null;
+
+    const connectedIds = connectedElementsMap.get(cameraEntry.connection) || [];
+    const beamId = connectedIds.find((id) => {
+        const entry = monitoredElements.get(id);
+        return String(entry?.type || "").toLowerCase() === "beam";
+    });
+
+    if (!beamId) {
+        return {
+            objectId: null,
+            entry: null,
+            connectedIds
+        };
+    }
+
+    return {
+        objectId: beamId,
+        entry: monitoredElements.get(beamId),
+        connectedIds
+    };
+}
+
+function microDebugResolveDetectionMarkers(alertRows) {
+    const rows = Array.isArray(alertRows) ? alertRows : [];
+
+    const results = rows.map((row, index) => {
+        const cameraMatch = microFindCameraForAlert(row);
+        const beamMatch = cameraMatch?.entry ? microFindBeamForCamera(cameraMatch.entry) : null;
+
+        return {
+            index,
+            alert: {
+                target_ip: row?.target_ip || null,
+                sensor_ip: row?.sensor_ip || null,
+                sensor_name: row?.sensor_name || null,
+                sensor_hostname: row?.sensor_hostname || null,
+                source_category: row?.source_category || null,
+                source_location: row?.source_location || null,
+                source_geolocation: row?.source_geolocation || null
+            },
+            camera: cameraMatch?.entry ? {
+                objectId: cameraMatch.objectId,
+                matchedKey: cameraMatch.matchedKey,
+                target: cameraMatch.entry.target || null,
+                type: cameraMatch.entry.type || null,
+                connection: cameraMatch.entry.connection || null,
+                sensor_ip: cameraMatch.entry.sensor_ip || null,
+                sensor_name: cameraMatch.entry.sensor_name || null,
+                sensor_hostname: cameraMatch.entry.sensor_hostname || null,
+                sensor_location: cameraMatch.entry.sensor_location || null,
+                sensor_geolocation: cameraMatch.entry.sensor_geolocation || null
+            } : null,
+            beam: beamMatch?.entry ? {
+                objectId: beamMatch.objectId,
+                type: beamMatch.entry.type || null,
+                connection: beamMatch.entry.connection || null,
+                beam_id: beamMatch.entry.beam_id || null,
+                location: beamMatch.entry.location || null,
+                fallback_position: beamMatch.entry.fallback_position || null,
+                marker_x_ratio: beamMatch.entry.marker_x_ratio || null,
+                marker_y_ratio: beamMatch.entry.marker_y_ratio || null,
+                azimuth_deg: beamMatch.entry.azimuth_deg || null,
+                horizontal_fov_deg: beamMatch.entry.horizontal_fov_deg || null,
+                vertical_fov_deg: beamMatch.entry.vertical_fov_deg || null,
+                range_m: beamMatch.entry.range_m || null
+            } : null,
+            debug: {
+                alertKeys: cameraMatch?.alertKeys || [],
+                cameraKeys: cameraMatch?.cameraKeys || [],
+                connectedIds: beamMatch?.connectedIds || []
+            }
+        };
+    });
+
+    console.log("[Micro Map] detection resolver results", results);
+    return results;
+}
+
+function microEnsureDetectionOverlay(svgElement) {
+    const ns = "http://www.w3.org/2000/svg";
+    let overlay = svgElement.querySelector("#micro-detection-overlay");
+
+    if (!overlay) {
+        overlay = document.createElementNS(ns, "g");
+        overlay.setAttribute("id", "micro-detection-overlay");
+        overlay.setAttribute("class", "micro-detection-overlay");
+        svgElement.appendChild(overlay);
+    }
+
+    return overlay;
+}
+
+function microClearDetectionMarkers() {
+    const container = document.getElementById("svg-container");
+    const svgElement = container ? container.querySelector("svg") : null;
+    const overlay = svgElement ? svgElement.querySelector("#micro-detection-overlay") : null;
+
+    if (overlay) {
+        overlay.innerHTML = "";
+    }
+}
+
+function microParseRatio(value, fallback = 0.5) {
+    const parsed = Number.parseFloat(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.max(0, Math.min(1, parsed));
+}
+
+function microGetSvgPointFromClientPoint(svgElement, clientX, clientY) {
+    if (!svgElement || typeof svgElement.createSVGPoint !== "function") {
+        return { x: clientX, y: clientY };
+    }
+
+    const point = svgElement.createSVGPoint();
+    point.x = clientX;
+    point.y = clientY;
+
+    const ctm = svgElement.getScreenCTM();
+    if (!ctm) {
+        return { x: clientX, y: clientY };
+    }
+
+    return point.matrixTransform(ctm.inverse());
+}
+
+function microGetBeamMarkerPosition(svgElement, beamEntry) {
+    if (!svgElement || !beamEntry || !beamEntry.visualGroup) {
+        return null;
+    }
+
+    const bbox = beamEntry.visualGroup.getBoundingClientRect();
+    if (!bbox || bbox.width <= 0 || bbox.height <= 0) {
+        return null;
+    }
+
+    const xRatio = microParseRatio(beamEntry.marker_x_ratio, 0.5);
+    const yRatio = microParseRatio(beamEntry.marker_y_ratio, 0.5);
+
+    const clientX = bbox.left + (bbox.width * xRatio);
+    const clientY = bbox.top + (bbox.height * yRatio);
+
+    return microGetSvgPointFromClientPoint(svgElement, clientX, clientY);
+}
+
+function microClampNumber(value, min, max) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return min;
+    return Math.max(min, Math.min(max, parsed));
+}
+
+function microDegToRad(value) {
+    return Number(value) * Math.PI / 180;
+}
+
+function microRadToDeg(value) {
+    return Number(value) * 180 / Math.PI;
+}
+
+function microNormalizeAngleDeltaDeg(value) {
+    let angle = Number(value);
+    if (!Number.isFinite(angle)) return null;
+
+    while (angle > 180) angle -= 360;
+    while (angle < -180) angle += 360;
+
+    return angle;
+}
+
+function microParseGeoLocation(value) {
+    if (value == null) return null;
+
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            const parsed = microParseGeoLocation(item);
+            if (parsed) return parsed;
+        }
+        return null;
+    }
+
+    if (typeof value === "object") {
+        const lat = Number(value.lat ?? value.latitude ?? value.Latitude);
+        const lon = Number(value.lon ?? value.lng ?? value.longitude ?? value.Longitude);
+        const alt = Number(value.alt ?? value.altitude ?? value.Altitude ?? 0);
+
+        if (Number.isFinite(lat) && Number.isFinite(lon)) {
+            return { lat, lon, alt: Number.isFinite(alt) ? alt : 0 };
+        }
+
+        return null;
+    }
+
+    const text = String(value || "").trim();
+    if (!text) return null;
+
+    const numbers = text.match(/-?\d+(?:\.\d+)?/g);
+    if (!numbers || numbers.length < 2) return null;
+
+    const lat = Number(numbers[0]);
+    const lon = Number(numbers[1]);
+    const alt = numbers.length >= 3 ? Number(numbers[2]) : 0;
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+
+    return {
+        lat,
+        lon,
+        alt: Number.isFinite(alt) ? alt : 0
+    };
+}
+
+function microDistanceMeters(from, to) {
+    if (!from || !to) return null;
+
+    const earthRadiusMeters = 6371000;
+    const lat1 = microDegToRad(from.lat);
+    const lat2 = microDegToRad(to.lat);
+    const dLat = microDegToRad(to.lat - from.lat);
+    const dLon = microDegToRad(to.lon - from.lon);
+
+    const a =
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(lat1) * Math.cos(lat2) *
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return earthRadiusMeters * c;
+}
+
+function microBearingDeg(from, to) {
+    if (!from || !to) return null;
+
+    const lat1 = microDegToRad(from.lat);
+    const lat2 = microDegToRad(to.lat);
+    const dLon = microDegToRad(to.lon - from.lon);
+
+    const y = Math.sin(dLon) * Math.cos(lat2);
+    const x =
+        Math.cos(lat1) * Math.sin(lat2) -
+        Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+
+    const bearing = (microRadToDeg(Math.atan2(y, x)) + 360) % 360;
+    return bearing;
+}
+
+function microParseCaptureZone(value) {
+    if (!value) return null;
+
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            const parsed = microParseCaptureZone(item);
+            if (parsed) return parsed;
+        }
+        return null;
+    }
+
+    if (typeof value === "object") {
+        return value;
+    }
+
+    const text = String(value || "").trim();
+    if (!text) return null;
+
+    try {
+        const parsed = JSON.parse(text);
+        return microParseCaptureZone(parsed);
+    } catch (_error) {
+        return null;
+    }
+}
+
+function microPickNumericField(source, fieldNames) {
+    if (!source || typeof source !== "object") return null;
+
+    for (const fieldName of fieldNames) {
+        const value = Number(source[fieldName]);
+        if (Number.isFinite(value)) {
+            return value;
+        }
+    }
+
+    return null;
+}
+
+function microGetCameraCoverageNumber(row, beamEntry, fieldNames, fallback = null) {
+    const captureZone = microParseCaptureZone(row?.sensor_capturezone);
+    const fromCaptureZone = microPickNumericField(captureZone, fieldNames);
+
+    if (fromCaptureZone !== null) {
+        return fromCaptureZone;
+    }
+
+    const fromBeam = microPickNumericField(beamEntry, fieldNames);
+
+    if (fromBeam !== null) {
+        return fromBeam;
+    }
+
+    return fallback;
+}
+
+function microGetVisualCenterClient(entry) {
+    if (!entry || !entry.visualGroup || typeof entry.visualGroup.getBoundingClientRect !== "function") {
+        return null;
+    }
+
+    const rect = entry.visualGroup.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) {
+        return null;
+    }
+
+    return {
+        x: rect.left + (rect.width / 2),
+        y: rect.top + (rect.height / 2),
+        rect
+    };
+}
+
+function microGetBeamCoordinateFrame(cameraEntry, beamEntry) {
+    const cameraCenter = microGetVisualCenterClient(cameraEntry);
+    const beamCenter = microGetVisualCenterClient(beamEntry);
+
+    if (!cameraCenter || !beamCenter) {
+        return null;
+    }
+
+    const axisDx = beamCenter.x - cameraCenter.x;
+    const axisDy = beamCenter.y - cameraCenter.y;
+    const axisLength = Math.sqrt((axisDx * axisDx) + (axisDy * axisDy));
+
+    if (!Number.isFinite(axisLength) || axisLength <= 0) {
+        return null;
+    }
+
+    const axisX = axisDx / axisLength;
+    const axisY = axisDy / axisLength;
+
+    // Right side relative to the camera direction, in screen coordinates.
+    const rightX = -axisY;
+    const rightY = axisX;
+
+    const rect = beamCenter.rect;
+    const corners = [
+        { x: rect.left, y: rect.top },
+        { x: rect.right, y: rect.top },
+        { x: rect.right, y: rect.bottom },
+        { x: rect.left, y: rect.bottom }
+    ];
+
+    const projections = corners.map((corner) => {
+        const dx = corner.x - cameraCenter.x;
+        const dy = corner.y - cameraCenter.y;
+
+        return {
+            t: (dx * axisX) + (dy * axisY),
+            l: (dx * rightX) + (dy * rightY)
+        };
+    });
+
+    const positiveProjections = projections.filter((item) => item.t > 0);
+
+    if (!positiveProjections.length) {
+        return null;
+    }
+
+    const nearT = Math.max(0, Math.min(...positiveProjections.map((item) => item.t)));
+    const farT = Math.max(...positiveProjections.map((item) => item.t));
+    const maxL = Math.max(...positiveProjections.map((item) => Math.abs(item.l)));
+
+    if (!Number.isFinite(farT) || farT <= nearT || !Number.isFinite(maxL) || maxL <= 0) {
+        return null;
+    }
+
+    return {
+        origin: cameraCenter,
+        axisX,
+        axisY,
+        rightX,
+        rightY,
+        nearT,
+        farT,
+        maxL
+    };
+}
+
+function microGetGeoBasedMarkerPosition(svgElement, row, cameraEntry, beamEntry) {
+    const sourceGeo = microParseGeoLocation(row?.source_geolocation);
+    const sensorGeo =
+        microParseGeoLocation(row?.sensor_geolocation) ||
+        microParseGeoLocation(cameraEntry?.sensor_geolocation);
+
+    if (!svgElement || !row || !cameraEntry || !beamEntry || !sourceGeo || !sensorGeo) {
+        return null;
+    }
+
+    const azimuthDeg = microGetCameraCoverageNumber(
+        row,
+        beamEntry,
+        ["azimuth_deg", "azimuth"],
+        null
+    );
+
+    const horizontalFovDeg = microGetCameraCoverageNumber(
+        row,
+        beamEntry,
+        ["horizontal_fov_deg", "horizontal_fov"],
+        null
+    );
+
+    const rangeM = microGetCameraCoverageNumber(
+        row,
+        beamEntry,
+        ["range_m", "range"],
+        null
+    );
+
+    if (
+        !Number.isFinite(Number(azimuthDeg)) ||
+        !Number.isFinite(Number(horizontalFovDeg)) ||
+        !Number.isFinite(Number(rangeM)) ||
+        Number(horizontalFovDeg) <= 0 ||
+        Number(rangeM) <= 0
+    ) {
+        return null;
+    }
+
+    const distanceM = microDistanceMeters(sensorGeo, sourceGeo);
+    const bearingDeg = microBearingDeg(sensorGeo, sourceGeo);
+
+    if (!Number.isFinite(distanceM) || !Number.isFinite(bearingDeg)) {
+        return null;
+    }
+
+    const angleDeltaDeg = microNormalizeAngleDeltaDeg(bearingDeg - Number(azimuthDeg));
+    if (angleDeltaDeg === null) {
+        return null;
+    }
+
+    const halfFovDeg = Number(horizontalFovDeg) / 2;
+    const fovToleranceDeg = 5;
+
+    // If the detected object is clearly outside the camera cone, keep the old fallback.
+    if (Math.abs(angleDeltaDeg) > halfFovDeg + fovToleranceDeg) {
+        console.warn("[Micro Map] Geo marker outside camera FOV, using fallback", {
+            source_geolocation: row?.source_geolocation,
+            sensor_geolocation: row?.sensor_geolocation || cameraEntry?.sensor_geolocation,
+            azimuthDeg,
+            bearingDeg,
+            angleDeltaDeg,
+            horizontalFovDeg
+        });
+        return null;
+    }
+
+    const frame = microGetBeamCoordinateFrame(cameraEntry, beamEntry);
+    if (!frame) {
+        return null;
+    }
+
+    const distanceRatio = microClampNumber(distanceM / Number(rangeM), 0, 1);
+    const angleRatio = microClampNumber(angleDeltaDeg / halfFovDeg, -1, 1);
+
+    const depthT = frame.nearT + ((frame.farT - frame.nearT) * distanceRatio);
+
+    // Width grows with distance from the camera.
+    // Keep a small minimum so very near detections remain visible and not glued to the axis.
+    const lateralScale = Math.max(0.10, distanceRatio);
+    const lateral = angleRatio * frame.maxL * lateralScale;
+
+    const clientX = frame.origin.x + (frame.axisX * depthT) + (frame.rightX * lateral);
+    const clientY = frame.origin.y + (frame.axisY * depthT) + (frame.rightY * lateral);
+
+    const point = microGetSvgPointFromClientPoint(svgElement, clientX, clientY);
+
+    point._geoDebug = {
+        source_geolocation: row?.source_geolocation || null,
+        sensor_geolocation: row?.sensor_geolocation || cameraEntry?.sensor_geolocation || null,
+        distanceM,
+        bearingDeg,
+        azimuthDeg: Number(azimuthDeg),
+        angleDeltaDeg,
+        horizontalFovDeg: Number(horizontalFovDeg),
+        rangeM: Number(rangeM),
+        distanceRatio,
+        angleRatio
+    };
+
+    return point;
+}
+
+function microGetMarkerTextForAlert(row) {
+    const categories = Array.isArray(row?.source_category)
+        ? row.source_category
+        : [row?.source_category].filter(Boolean);
+
+    if (categories.includes("Object.LivingBeings.Human")) {
+        return "👤";
+    }
+
+    return "!";
+}
+
+function microAddDetectionMarker(svgElement, overlay, point, row, index) {
+    if (!svgElement || !overlay || !point) return;
+
+    const ns = "http://www.w3.org/2000/svg";
+    const marker = document.createElementNS(ns, "g");
+    marker.setAttribute("class", "micro-detection-marker");
+    marker.setAttribute("data-alert-index", String(index));
+    marker.setAttribute("transform", `translate(${point.x} ${point.y})`);
+
+    const circle = document.createElementNS(ns, "circle");
+    circle.setAttribute("r", "16");
+    circle.setAttribute("fill", "#ffffff");
+    circle.setAttribute("stroke", "#FE0000");
+    circle.setAttribute("stroke-width", "3");
+
+    const iconName = microResolveDetectionIconName(row);
+    const icon = microCreateSvgIcon(ns, iconName, {
+        size: 22,
+        fill: "#FE0000"
+    });
+
+    marker.appendChild(circle);
+    marker.appendChild(icon);
+
+    const title = document.createElementNS(ns, "title");
+    title.textContent = row?.description || "Detection marker";
+    marker.appendChild(title);
+
+    overlay.appendChild(marker);
+}
+
+function microRenderDetectionMarkers(alertRows) {
+    const container = document.getElementById("svg-container");
+    const svgElement = container ? container.querySelector("svg") : null;
+    if (!svgElement) return;
+
+    const overlay = microEnsureDetectionOverlay(svgElement);
+    overlay.innerHTML = "";
+
+    const resolved = microDebugResolveDetectionMarkers(alertRows);
+    const placements = [];
+
+    resolved.forEach((result) => {
+        if (!result || !result.beam || !result.beam.objectId) return;
+
+        const beamEntry = monitoredElements.get(result.beam.objectId);
+        const cameraEntry = result.camera?.objectId
+            ? monitoredElements.get(result.camera.objectId)
+            : null;
+
+        const row = Array.isArray(alertRows) ? alertRows[result.index] : null;
+
+        const geoPoint = microGetGeoBasedMarkerPosition(
+            svgElement,
+            row,
+            cameraEntry,
+            beamEntry
+        );
+
+        const fallbackPoint = geoPoint
+            ? null
+            : microGetBeamMarkerPosition(svgElement, beamEntry);
+
+        const point = geoPoint || fallbackPoint;
+
+        if (!point) {
+            console.warn("[Micro Map] Cannot compute detection marker position", result);
+            return;
+        }
+
+        placements.push({
+            index: result.index,
+            row,
+            result,
+            cameraEntry,
+            beamEntry,
+            point,
+            positionSource: geoPoint ? "geolocation" : "beam_ratio",
+            geoDebug: geoPoint?._geoDebug || null
+        });
+    });
+
+    microBuildOffsetMarkerPlacements(placements);
+
+    console.log("[Micro Map] detection marker placements", placements.map((placement) => ({
+        index: placement.index,
+        icon: microResolveDetectionIconName(placement.row),
+        source_category: placement.row?.source_category || null,
+        source_geolocation: placement.row?.source_geolocation || null,
+        sensor_geolocation: placement.row?.sensor_geolocation || placement.cameraEntry?.sensor_geolocation || null,
+        beam_id: placement.beamEntry?.beam_id || null,
+        beam_object_id: placement.beamEntry?.objectId || null,
+        position_source: placement.positionSource,
+        geo_debug: placement.geoDebug,
+        originalPoint: placement.originalPoint || placement.point,
+        offset: placement.offset || { x: 0, y: 0 },
+        finalPoint: placement.point
+    })));
+
+    placements.forEach((placement) => {
+        microAddDetectionMarker(
+            svgElement,
+            overlay,
+            placement.point,
+            placement.row,
+            placement.index
+        );
+    });
+}
+
 function createEmptySeverityCount() {
     return { Low: 0, Medium: 0, High: 0, Info: 0 };
 }
@@ -1794,6 +2569,27 @@ function applyAggregatedAlertsToMonitoredElements(alertRows) {
     }
 }
 
+async function refreshMicroData() {
+    if (isMicroRefreshInProgress) return;
+
+    isMicroRefreshInProgress = true;
+    const btn = document.getElementById("refresh-data-micro");
+    const icon = btn && btn.querySelector("i");
+    if (icon) {
+        icon.classList.add("spin");
+    }
+
+    try {
+        await refreshAlertsForCurrentMap();
+        await refreshAlertsFromMacroMapFallback();
+    } finally {
+        isMicroRefreshInProgress = false;
+        if (icon) {
+            icon.classList.remove("spin");
+        }
+    }
+}
+
 async function refreshAlertsForCurrentMap() {
     const assetRef = ensureCurrentAssetRef();
     if (!assetRef) {
@@ -1805,28 +2601,41 @@ async function refreshAlertsForCurrentMap() {
         return;
     }
 
+    const requestPayload = {
+        asset_ref: assetRef,
+        ref_type: getCurrentRefType(),
+        start_date: dates.start_date,
+        end_date: dates.end_date,
+    };
+
     try {
         const response = await $.ajax({
             url: "/micro_map/get_micro_alerts_bulk_for_asset",
             type: "POST",
             dataType: "json",
-            data: {
-                asset_ref: assetRef,
-                ref_type: getCurrentRefType(),
-                start_date: dates.start_date,
-                end_date: dates.end_date,
-            }
+            data: requestPayload
+        });
+
+        console.log("[Micro Map] get_micro_alerts_bulk_for_asset response", {
+            request: requestPayload,
+            response: response
         });
 
         if (response && response.status === "success") {
-            applyAggregatedAlertsToMonitoredElements(response.data || []);
+            const alertRows = response.data || [];
+
+            applyAggregatedAlertsToMonitoredElements(alertRows);
+            microRenderDetectionMarkers(alertRows);
+
             return;
         }
 
         applyAggregatedAlertsToMonitoredElements([]);
+        microClearDetectionMarkers();
     } catch (error) {
-        console.log("Error in bulk alert load:", error);
+        console.log("[Micro Map] Error in bulk alert load:", error);
         applyAggregatedAlertsToMonitoredElements([]);
+        microClearDetectionMarkers();
     }
 }
 
@@ -2152,9 +2961,9 @@ function processSvgDocument(svgText, objectRulesById = {}) {
         const objectId = obj.getAttribute("id");
         if (!objectId) return;
 
-        const target = obj.getAttribute("target") || null;
-        const connection = obj.getAttribute("connection") || null;
-        const type = obj.getAttribute("type") || null;
+        const target = microGetObjectAttr(obj, "target");
+        const connection = microGetObjectAttr(obj, "connection");
+        const type = microGetObjectAttr(obj, "type");
 
         const visualGroup = svgElement.querySelector(`[data-cell-id="${objectId}"]`);
         if (!visualGroup) return;
@@ -2168,14 +2977,41 @@ function processSvgDocument(svgText, objectRulesById = {}) {
         const entry = {
             objectId,
             shapes,
-            type,
-            label: target || connection || objectId,
+            visualGroup,
+            type: type || null,
+
+            target: target || null,
+            connection: connection || null,
+
+            sensor_id: microGetObjectAttr(obj, "sensor_id") || null,
+            sensor_ip: microGetObjectAttr(obj, "sensor_ip") || null,
+            sensor_name: microGetObjectAttr(obj, "sensor_name") || null,
+            sensor_hostname: microGetObjectAttr(obj, "sensor_hostname") || null,
+            sensor_location: microGetObjectAttr(obj, "sensor_location") || null,
+            sensor_geolocation: microGetObjectAttr(obj, "sensor_geolocation") || null,
+
+            beam_id: microGetObjectAttr(obj, "beam_id") || null,
+            location: microGetObjectAttr(obj, "location") || null,
+            fallback_position: microGetObjectAttr(obj, "fallback_position") || null,
+            marker_x_ratio: microGetObjectAttr(obj, "marker_x_ratio") || null,
+            marker_y_ratio: microGetObjectAttr(obj, "marker_y_ratio") || null,
+            azimuth_deg: microGetObjectAttr(obj, "azimuth_deg") || null,
+            horizontal_fov_deg: microGetObjectAttr(obj, "horizontal_fov_deg") || null,
+            vertical_fov_deg: microGetObjectAttr(obj, "vertical_fov_deg") || null,
+            range_m: microGetObjectAttr(obj, "range_m") || null,
+
+            label: microPickFirstNonEmpty([
+                target,
+                microGetObjectAttr(obj, "sensor_name"),
+                microGetObjectAttr(obj, "beam_id"),
+                connection,
+                objectId
+            ]),
             lastSeverityCount: createEmptySeverityCount(),
             lastAlertRows: []
         };
 
         if (target) {
-            entry.target = target;
             entry.rules = microNormalizeRules(objectRulesById[objectId]);
             shapes.forEach(shape => {
                 applySmartColorToShape(shape, MICRO_DEFAULT_COLOR);
@@ -2188,7 +3024,6 @@ function processSvgDocument(svgText, objectRulesById = {}) {
         }
 
         if (connection) {
-            entry.connection = connection;
             if (!connectedElementsMap.has(connection)) {
                 connectedElementsMap.set(connection, []);
             }
@@ -2197,6 +3032,23 @@ function processSvgDocument(svgText, objectRulesById = {}) {
 
         monitoredElements.set(objectId, entry);
     });
+
+    console.log("[Micro Map] monitored SVG entries", Array.from(monitoredElements.entries()).map(([objectId, entry]) => ({
+        objectId,
+        type: entry.type,
+        target: entry.target,
+        connection: entry.connection,
+        sensor_ip: entry.sensor_ip,
+        sensor_name: entry.sensor_name,
+        sensor_hostname: entry.sensor_hostname,
+        sensor_location: entry.sensor_location,
+        beam_id: entry.beam_id,
+        location: entry.location,
+        marker_x_ratio: entry.marker_x_ratio,
+        marker_y_ratio: entry.marker_y_ratio
+    })));
+
+    console.log("[Micro Map] connected elements", Array.from(connectedElementsMap.entries()));
 
     const container = document.getElementById("svg-container");
     container.innerHTML = "";
@@ -2330,4 +3182,133 @@ function blinkRandomConnectedElement() {
     } else {
         console.warn(`No "beam" element found in connection ${connectionId}`);
     }
+}
+
+function microCreateSvgIcon(ns, iconName, options = {}) {
+    const iconSpec = MICRO_DETECTION_ICON_LIBRARY[iconName] || MICRO_DETECTION_ICON_LIBRARY.fallback;
+    const viewBox = String(iconSpec.viewBox || "0 0 24 24").trim();
+    const pathData = String(iconSpec.path || MICRO_DETECTION_ICON_LIBRARY.fallback.path).trim();
+
+    const [minX, minY, width, height] = viewBox
+        .split(/\s+/)
+        .map((value) => Number.parseFloat(value));
+
+    const safeWidth = Number.isFinite(width) && width > 0 ? width : 24;
+    const safeHeight = Number.isFinite(height) && height > 0 ? height : 24;
+    const safeMinX = Number.isFinite(minX) ? minX : 0;
+    const safeMinY = Number.isFinite(minY) ? minY : 0;
+
+    const size = Number.isFinite(Number(options.size)) ? Number(options.size) : 22;
+    const fill = options.fill || "#FE0000";
+
+    const scale = Math.min(size / safeWidth, size / safeHeight);
+    const offsetX = -(safeWidth * scale) / 2 - (safeMinX * scale);
+    const offsetY = -(safeHeight * scale) / 2 - (safeMinY * scale);
+
+    const icon = document.createElementNS(ns, "g");
+    icon.setAttribute("class", `micro-detection-icon micro-detection-icon-${iconName}`);
+    icon.setAttribute("transform", `translate(${offsetX} ${offsetY}) scale(${scale})`);
+    icon.setAttribute("fill", fill);
+
+    const path = document.createElementNS(ns, "path");
+    path.setAttribute("d", pathData);
+
+    icon.appendChild(path);
+    return icon;
+}
+
+function microResolveDetectionIconName(row) {
+    const categories = Array.isArray(row?.source_category)
+        ? row.source_category
+        : [row?.source_category].filter(Boolean);
+
+    if (categories.includes("Object.LivingBeings.Human")) {
+        return "human";
+    }
+
+    return "fallback";
+}
+
+function microGetMarkerCollisionKey(point, tolerance = 4) {
+    if (!point) return "";
+
+    const safeTolerance = Number.isFinite(Number(tolerance)) && Number(tolerance) > 0
+        ? Number(tolerance)
+        : 4;
+
+    const x = Math.round(Number(point.x || 0) / safeTolerance) * safeTolerance;
+    const y = Math.round(Number(point.y || 0) / safeTolerance) * safeTolerance;
+
+    return `${x}:${y}`;
+}
+
+function microGetCollisionOffset(index, total, spacing = 44) {
+    if (total <= 1) {
+        return { x: 0, y: 0 };
+    }
+
+    const safeIndex = Number.isFinite(Number(index)) ? Number(index) : 0;
+    const safeTotal = Number.isFinite(Number(total)) && Number(total) > 0 ? Number(total) : 1;
+    const safeSpacing = Number.isFinite(Number(spacing)) && Number(spacing) > 0 ? Number(spacing) : 44;
+
+    // Two markers: split them symmetrically around the original point.
+    if (safeTotal === 2) {
+        return {
+            x: safeIndex === 0 ? -(safeSpacing / 2) : (safeSpacing / 2),
+            y: 0
+        };
+    }
+
+    // Three or more: arrange them around the original point.
+    const radius = safeTotal <= 4 ? safeSpacing * 0.72 : safeSpacing;
+    const angle = (-Math.PI / 2) + ((Math.PI * 2 * safeIndex) / safeTotal);
+
+    return {
+        x: Math.cos(angle) * radius,
+        y: Math.sin(angle) * radius
+    };
+}
+
+function microApplyMarkerOffset(point, offset) {
+    return {
+        x: Number(point.x || 0) + Number(offset.x || 0),
+        y: Number(point.y || 0) + Number(offset.y || 0)
+    };
+}
+
+function microBuildOffsetMarkerPlacements(placements) {
+    const groups = new Map();
+
+    placements.forEach((placement) => {
+        const key = microGetMarkerCollisionKey(placement.point);
+        if (!key) return;
+
+        if (!groups.has(key)) {
+            groups.set(key, []);
+        }
+
+        groups.get(key).push(placement);
+    });
+
+    groups.forEach((group) => {
+        group.forEach((placement, index) => {
+            const offset = microGetCollisionOffset(index, group.length);
+            placement.originalPoint = placement.point;
+            placement.offset = offset;
+            placement.point = microApplyMarkerOffset(placement.point, offset);
+        });
+    });
+
+    return placements;
+}
+
+function downloadBase64File(filename, contentType, base64Data) {
+    const binary = atob(base64Data);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+
+    const blob = new Blob([bytes], { type: contentType || "application/octet-stream" });
+
+    saveAs(blob, filename || "download");
 }

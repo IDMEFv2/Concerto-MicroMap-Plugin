@@ -42,6 +42,11 @@
         </div>
       </div>
 
+      <button id="refresh-data-micro" type="button" class="micro-menu-item">
+        <i class="bi bi-arrow-clockwise"></i>
+        <span>Refresh data</span>
+      </button>
+
       <div class="micro-menu-section-title micro-testing-title">Testing</div>
 
       <button id="blink-random" type="button">Blink Obj</button>
@@ -88,6 +93,10 @@
       </div>
       <div class="flex w-100 justify-end">
         <button id="manage-upload-save-button" class="btn btn-primary" type="button">Upload and save</button>
+      </div>
+      <div class="flex align-center gap-1/2 wrap pl-1 pr-1">
+        <span><span class="bold">(optional)</span> - Read the SVG template usage guide:</span>
+        <button id="download-svg-guide" class="btn btn-link pl-0 pr-0">Download</button>
       </div>
     </div>
 
@@ -195,6 +204,7 @@
 
 <script type="text/javascript">
   $LAB
+    .script("https://unpkg.com/file-saver@2.0.5/dist/FileSaver.min.js")
     .script("micro_map/js/micro_map.js")
     .wait(function() {
       initializeListeners();

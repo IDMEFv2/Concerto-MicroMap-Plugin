@@ -21,6 +21,7 @@ setup(name="prewikka-apps-micro_map",
               "sql/*.py",
               "htdocs/css/*.css",
               "htdocs/js/*.js",
+              "htdocs/samples/*.md",
               "htdocs/samples/presets/*.svg"
           ],
       },
