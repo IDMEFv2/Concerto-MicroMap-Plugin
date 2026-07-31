@@ -15,8 +15,18 @@ This plugin provides an SVG-based floor-plan visualization layer for IDMEFv2 ale
 - **Color Coding**: SVG elements are colored dynamically according to alert severity and rule evaluation.
 - **Live Aggregation**: Alert rows are aggregated per monitored element and updated on refresh cycles.
 - **Severity Awareness**: High/Medium/Low/Info distributions are available for rule checks and UI feedback.
+- **Manual Refresh**: A dedicated **Refresh data** action in the sidebar re-queries alerts on demand, with a spinner indicator while the refresh is in progress.
+- **Extended IDMEFv2 Field Set**: Alert queries pull a wide set of fields beyond the base target/priority/analyzer set, including `type`, `category`, `description`, `create_time`, `start_time`, and detailed `target.*`, `analyzer.*`, `sensor.*`, and `source.*` sub-fields (id, ip, hostname, category, location, geolocation, and more).
 
-### 3. Per-Object Rule Engine
+### 3. Camera Field-of-View Detection Markers
+- **Camera/Beam Objects**: In addition to simple monitored objects, floor plans support a linked pair of **camera** and **beam** objects representing a physical camera and its field of view.
+- **Alert-to-Camera Matching**: Alerts are matched to camera objects using sensor identifiers (`sensor_ip`, `sensor_name`, `sensor_hostname`).
+- **Geolocation-Based Placement**: When geolocation data is available, detection markers are placed inside the camera's field of view using distance/bearing computed from camera and alert geolocation, azimuth, horizontal/vertical FOV, and range.
+- **Ratio-Based Fallback**: If geolocation cannot be resolved, markers fall back to a fixed position within the beam shape (`marker_x_ratio` / `marker_y_ratio`).
+- **Collision Handling**: Markers that would overlap are automatically offset so multiple detections in the same area remain distinguishable.
+- **Detection Icons**: Markers are rendered as SVG icons (e.g. a human silhouette, with a generic fallback icon) based on the alert content.
+
+### 4. Per-Object Rule Engine
 Users can define rules for each monitored object directly from the UI:
 - **Percentage Rules**: Change color if High/Medium/Low alerts exceed a configured percentage.
 - **Regex Rules**: Change color if alert text/description matches specific patterns.
@@ -24,38 +34,39 @@ Users can define rules for each monitored object directly from the UI:
 - **Object Scope**: Rules are stored per SVG object, allowing independent behavior by asset.
 - **Dynamic Editing**: Rules can be added, edited, and removed from the rules modal.
 
-### 4. Persistent Floor Plan State
+### 5. Persistent Floor Plan State
 - **Server-side Persistence**: Floor plans and metadata are persisted server-side.
 - **Rules Persistence**: Per-object rules are stored and restored together with floor plan data.
 - **Plan Registry**: Plan definitions are maintained in file-based storage under `/tmp/prewikka_micro_map/floor_plans.json`.
 - **State Recovery**: Existing plans and their rule sets are restored when reopening the view.
 
-### 5. Plan Management
+### 6. Plan Management
 - **Add Plan**: Upload and register new SVG floor plans.
 - **Load Plan**: Open a selected floor plan from the available plan list.
 - **Delete Plan**: Remove floor plans no longer needed.
 - **Bulk Plan Discovery**: Supports list and bulk list APIs for cross-plugin navigation use cases.
+- **SVG Template Guide Download**: The Add/Manage Plan modal offers a one-click download of the bundled `drawio_svg_template_guide.md`, documenting how to prepare a valid draw.io SVG (simple monitored objects, camera/beam objects, and required metadata fields).
 
-### 6. Macro/Micro Navigation Integration
+### 7. Macro/Micro Navigation Integration
 - **Explicit Micro Routes**: Dedicated `/micro_map/*` endpoints for plan and alert operations.
 - **Macro Context Menu Integration**: Macro entities can navigate to specific Micro plans from a dynamic per-plan submenu.
 - **Shared Navigation Context**: Macro writes per-user navigation context in `/tmp/prewikka_plugin_navigation/context.json`; Micro consumes it through `/micro_map/get_micro_navigation_context`.
 - **Context Fields**: `has_reference`, `asset_ref`, `ref_type`, `source`, `svg_name`.
 - **One-shot Consumption**: Navigation context is consumed when read, avoiding stale cross-navigation state.
 
-### 7. Context and Time Synchronization
+### 8. Context and Time Synchronization
 - **Context Transfer**: Selected macro context can be propagated to micro navigation flows.
 - **Time Range Sync**: Alert queries respect the global Prewikka time selection.
 - **Dynamic Refresh**: Changing time range updates computed alert aggregates and visual state.
 
-### 8. Sidebar and UX Improvements
+### 9. Sidebar and UX Improvements
 - **Structured Sidebar**: Dedicated Menu and Testing sections for clear operator flow.
 - **Floor Plan Switcher**: Permanent plan selector (`floor-plan-select`) in the sidebar.
 - **Asset Switcher**: Dedicated asset selector in sidebar for changing target entity without returning to Macro.
 - **Rules Modal**: Macro-aligned modal structure for consistent rule editing experience.
 - **Defensive Event Binding**: Safe listener registration avoids runtime crashes from missing DOM nodes.
 
-### 9. Selector and Loading Behavior
+### 10. Selector and Loading Behavior
 - **No Default Selector Card in DOM**: The asset selector card is not pre-rendered at page load.
 - **Selector Created on Demand**: The selector card is created only when bootstrap confirms that no asset/plan can be loaded automatically.
 - **Loading-First Priority**: During load attempts (including `get_micro_plans_list` and `load_micro_floor_plan`), selector UI is suppressed to avoid transient flashes.
@@ -64,7 +75,7 @@ Users can define rules for each monitored object directly from the UI:
 - **Fallback Rule**: If no asset can be resolved after all load attempts complete, the selector card is then rendered and shown to the user.
 - **Empty-State Rule**: Empty-state guidance is shown only when the view is idle, no selector card is present, and no SVG is loaded.
 
-### 10. Micro Route Reference
+### 11. Micro Route Reference
 - `/micro_map/get_micro_navigation_context`: Reads and consumes per-user Macro navigation context.
 - `/micro_map/get_micro_plans_list`: Returns available floor plans for one asset.
 - `/micro_map/get_micro_plans_list_bulk`: Returns available floor plans for multiple assets.
@@ -72,6 +83,7 @@ Users can define rules for each monitored object directly from the UI:
 - `/micro_map/add_micro_floor_plan`: Stores or updates one floor plan and optional object rules.
 - `/micro_map/delete_micro_floor_plan`: Deletes a floor plan by `asset_ref` and `svg_name`.
 - `/micro_map/get_micro_alerts_bulk_for_asset`: Returns alert rows for a given asset and time range.
+- `/micro_map/download_svg_guide`: Returns the bundled draw.io SVG metadata guide as a base64-encoded file for client-side download.
 
 ---
 
