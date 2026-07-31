@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 
 setup(name="prewikka-apps-micro_map",
-      version="1.1.0",
+      version="1.2.0",
       author="Marco Compagno",
       author_email="marco_compagno@elmisoftware.com",
       url="https://www.prelude-siem.org",
